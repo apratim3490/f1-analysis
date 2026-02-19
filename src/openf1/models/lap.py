@@ -23,9 +23,9 @@ class Lap(BaseModel):
     lap_duration: float | None = None
     lap_number: int | None = None
     meeting_key: int | None = None
-    segments_sector_1: list[int] | None = None
-    segments_sector_2: list[int] | None = None
-    segments_sector_3: list[int] | None = None
+    segments_sector_1: list[int | None] | None = None
+    segments_sector_2: list[int | None] | None = None
+    segments_sector_3: list[int | None] | None = None
     session_key: int | None = None
     st_speed: float | None = None
 
