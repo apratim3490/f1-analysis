@@ -1,4 +1,4 @@
-# F1Analysis — Project Summary
+# f1-analysis — Project Summary
 
 ## Purpose
 

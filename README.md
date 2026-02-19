@@ -1,4 +1,4 @@
-# F1Analysis
+# f1-analysis
 
 Fully-typed Python client for the [OpenF1 API](https://openf1.org), providing access to Formula 1 telemetry, timing, sessions, and standings data (2023+).
 
@@ -6,7 +6,7 @@ Fully-typed Python client for the [OpenF1 API](https://openf1.org), providing ac
 
 ```bash
 # Clone and set up
-cd C:\Developer\F1Analysis
+cd C:\Developer\f1-analysis
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 pip install -e ".[dev]"
