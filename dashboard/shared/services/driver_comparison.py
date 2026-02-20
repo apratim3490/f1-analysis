@@ -58,6 +58,7 @@ class DriverPosition:
     acronym: str
     x: float
     y: float
+    speed: int
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,74 @@ def _estimate_stint_temperature(
     midpoint = (window_start + window_end) / 2
     nearest = min(timestamps, key=lambda t: abs(t[0].timestamp() - midpoint))
     return nearest[1]
+
+
+def _bisect_right_by_time(points: list[dict], t: float) -> int:
+    """Return the index where t would be inserted (by the 't' key)."""
+    lo, hi = 0, len(points)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if points[mid]["t"] <= t:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _interpolate_position(
+    loc: list[LocationPoint], t: float,
+) -> tuple[float, float] | None:
+    """Linearly interpolate x, y at time t from sorted location points.
+
+    Returns None only if the point list is empty or t is more than 0.5s
+    outside the data range.
+    """
+    if not loc:
+        return None
+
+    # Clamp to data range with a small tolerance
+    first_t, last_t = loc[0]["t"], loc[-1]["t"]
+    if t < first_t - 0.5 or t > last_t + 0.5:
+        return None
+    if t <= first_t:
+        return (loc[0]["x"], loc[0]["y"])
+    if t >= last_t:
+        return (loc[-1]["x"], loc[-1]["y"])
+
+    # Find bracketing points
+    idx = _bisect_right_by_time(loc, t)  # type: ignore[arg-type]
+    p_after = loc[idx]
+    p_before = loc[idx - 1]
+
+    dt = p_after["t"] - p_before["t"]
+    if dt <= 0:
+        return (p_before["x"], p_before["y"])
+
+    frac = (t - p_before["t"]) / dt
+    x = p_before["x"] + (p_after["x"] - p_before["x"]) * frac
+    y = p_before["y"] + (p_after["y"] - p_before["y"]) * frac
+    return (x, y)
+
+
+def _interpolate_speed(car: list[CarTelemetry], t: float) -> int:
+    """Look up the nearest speed value at time t from sorted car telemetry."""
+    if not car:
+        return 0
+
+    first_t, last_t = car[0]["t"], car[-1]["t"]
+    if t <= first_t:
+        return car[0]["speed"]
+    if t >= last_t:
+        return car[-1]["speed"]
+
+    idx = _bisect_right_by_time(car, t)  # type: ignore[arg-type]
+    p_after = car[idx]
+    p_before = car[idx - 1]
+
+    # Return the closer sample (no interpolation for speed — it's an int)
+    if abs(t - p_before["t"]) <= abs(t - p_after["t"]):
+        return p_before["speed"]
+    return p_after["speed"]
 
 
 class DriverComparisonService:
@@ -515,7 +584,8 @@ class DriverComparisonService:
         """Build track map animation data from location points.
 
         Uses the first driver's full location trace as the track outline,
-        then creates animation frames by aligning all drivers to common time points.
+        then creates animation frames with linearly interpolated positions
+        and speed readouts at fixed real-time intervals.
         """
         # Find a driver with location data for the track outline
         outline_locations: list[LocationPoint] | None = None
@@ -530,22 +600,14 @@ class DriverComparisonService:
         track_x = tuple(p["x"] for p in outline_locations)
         track_y = tuple(p["y"] for p in outline_locations)
 
-        # Collect all unique time points from all drivers
-        all_times: set[float] = set()
-        for data in telemetry_data.values():
-            for p in data["location"]:
-                all_times.add(round(p["t"], 2))
-
-        if not all_times:
-            return None
-
-        sorted_times = sorted(all_times)
-
         # Compute max lap duration across drivers
         max_duration = max(
             (p["t"] for data in telemetry_data.values() for p in data["location"]),
             default=0.0,
         )
+
+        if max_duration <= 0:
+            return None
 
         # Build driver colors map
         driver_colors: dict[str, str] = {}
@@ -555,31 +617,34 @@ class DriverComparisonService:
         # Build frames at a fixed real-time interval (250ms)
         frame_interval_s = 0.25
         frame_interval_ms = int(frame_interval_s * 1000)
-        sampled_times = []
+        sampled_times: list[float] = []
         t = 0.0
         while t <= max_duration:
-            sampled_times.append(t)
+            sampled_times.append(round(t, 3))
             t += frame_interval_s
 
-        # Pre-sort each driver's location by time for efficient nearest lookup
-        driver_sorted_locs: list[tuple[dict, list[LocationPoint]]] = []
+        # Pre-sort each driver's location and car data by time
+        driver_data_sorted: list[tuple[dict, list[LocationPoint], list[CarTelemetry]]] = []
         for data in telemetry_data.values():
             if data["location"]:
                 loc_sorted = sorted(data["location"], key=lambda p: p["t"])
-                driver_sorted_locs.append((data, loc_sorted))
+                car_sorted = sorted(data["car"], key=lambda p: p["t"]) if data["car"] else []
+                driver_data_sorted.append((data, loc_sorted, car_sorted))
 
         frames: list[TrackMapFrame] = []
         for t in sampled_times:
             positions: list[DriverPosition] = []
-            for data, loc in driver_sorted_locs:
-                # Binary search for nearest point
-                nearest = min(loc, key=lambda p: abs(p["t"] - t))
-                if abs(nearest["t"] - t) <= 0.5:
-                    positions.append(DriverPosition(
-                        acronym=data["acronym"],
-                        x=nearest["x"],
-                        y=nearest["y"],
-                    ))
+            for data, loc, car in driver_data_sorted:
+                pos = _interpolate_position(loc, t)
+                if pos is None:
+                    continue
+                speed = _interpolate_speed(car, t)
+                positions.append(DriverPosition(
+                    acronym=data["acronym"],
+                    x=pos[0],
+                    y=pos[1],
+                    speed=speed,
+                ))
             frames.append(TrackMapFrame(t=t, driver_positions=tuple(positions)))
 
         return TrackMapData(

@@ -337,73 +337,145 @@ if telemetry_data:
     if track_map is None:
         st.info("Track map data unavailable for the selected drivers.")
     else:
-        # Base track outline
-        fig_track = go.Figure()
-        fig_track.add_trace(go.Scatter(
-            x=list(track_map.track_x),
-            y=list(track_map.track_y),
-            mode="lines",
-            line=dict(color="#555555", width=2),
-            name="Track",
-            hoverinfo="skip",
-        ))
+        # Determine a stable trace order from the first non-empty frame
+        driver_order: list[str] = []
+        for f in track_map.frames:
+            if f.driver_positions:
+                driver_order = [dp.acronym for dp in f.driver_positions]
+                break
 
-        # Initial driver positions (first frame)
-        if track_map.frames:
-            first_frame = track_map.frames[0]
-            for dp in first_frame.driver_positions:
-                fig_track.add_trace(go.Scatter(
-                    x=[dp.x],
-                    y=[dp.y],
-                    mode="markers+text",
-                    marker=dict(size=12, color=track_map.driver_colors.get(dp.acronym, "#FFFFFF")),
-                    text=[dp.acronym],
-                    textposition="top center",
-                    textfont=dict(size=10, color=track_map.driver_colors.get(dp.acronym, "#FFFFFF")),
-                    name=dp.acronym,
-                    showlegend=True,
-                ))
-
-        # Animation frames
-        plotly_frames: list[go.Frame] = []
-        for frame in track_map.frames:
-            frame_data: list[go.Scatter] = [
+        def _build_frame_traces(
+            frame_positions: dict[str, object],
+        ) -> list[go.Scatter]:
+            """Build one track trace + one trace per driver (stable order)."""
+            traces: list[go.Scatter] = [
                 go.Scatter(
                     x=list(track_map.track_x),
                     y=list(track_map.track_y),
                     mode="lines",
                     line=dict(color="#555555", width=2),
+                    hoverinfo="skip",
                 ),
             ]
-            for dp in frame.driver_positions:
-                frame_data.append(go.Scatter(
-                    x=[dp.x],
-                    y=[dp.y],
-                    mode="markers+text",
-                    marker=dict(size=12, color=track_map.driver_colors.get(dp.acronym, "#FFFFFF")),
-                    text=[dp.acronym],
-                    textposition="top center",
-                    textfont=dict(size=10, color=track_map.driver_colors.get(dp.acronym, "#FFFFFF")),
+            for acronym in driver_order:
+                dp = frame_positions.get(acronym)
+                color = track_map.driver_colors.get(acronym, "#FFFFFF")
+                if dp is not None:
+                    traces.append(go.Scatter(
+                        x=[dp.x],
+                        y=[dp.y],
+                        mode="markers+text",
+                        marker=dict(size=14, color=color, line=dict(width=1, color="#FFFFFF")),
+                        text=[dp.acronym],
+                        textposition="top center",
+                        textfont=dict(size=10, color=color),
+                    ))
+                else:
+                    # Invisible placeholder to keep trace count stable
+                    traces.append(go.Scatter(
+                        x=[None], y=[None], mode="markers",
+                        marker=dict(size=0, color=color),
+                    ))
+            return traces
+
+        def _build_frame_annotations(
+            t: float, frame_positions: dict[str, object],
+        ) -> list[dict]:
+            """Build timer + per-driver speed annotations (paper coords)."""
+            mins = int(t) // 60
+            secs = t - mins * 60
+            annotations: list[dict] = [
+                dict(
+                    text=f"<b>{mins}:{secs:06.3f}</b>",
+                    x=1.0, y=1.0,
+                    xref="paper", yref="paper",
+                    xanchor="right", yanchor="top",
+                    showarrow=False,
+                    font=dict(size=22, color="#F0F0F0", family="monospace"),
+                    bgcolor="rgba(0,0,0,0.6)",
+                    borderpad=6,
+                ),
+            ]
+            # Speed readout for each driver, stacked below the timer
+            for i, acronym in enumerate(driver_order):
+                dp = frame_positions.get(acronym)
+                color = track_map.driver_colors.get(acronym, "#FFFFFF")
+                speed_text = f"{dp.speed} km/h" if dp is not None else "---"
+                annotations.append(dict(
+                    text=f"<b>{acronym}</b>  {speed_text}",
+                    x=1.0, y=0.92 - i * 0.06,
+                    xref="paper", yref="paper",
+                    xanchor="right", yanchor="top",
+                    showarrow=False,
+                    font=dict(size=15, color=color, family="monospace"),
+                    bgcolor="rgba(0,0,0,0.5)",
+                    borderpad=4,
                 ))
-            plotly_frames.append(go.Frame(data=frame_data, name=f"{frame.t:.1f}s"))
+            return annotations
+
+        # Base figure — first frame
+        fig_track = go.Figure()
+        first_positions: dict[str, object] = {}
+        if track_map.frames:
+            first_positions = {dp.acronym: dp for dp in track_map.frames[0].driver_positions}
+
+        for trace in _build_frame_traces(first_positions):
+            fig_track.add_trace(trace)
+
+        # Set initial legend names
+        for i, acronym in enumerate(driver_order):
+            fig_track.data[i + 1].name = acronym  # type: ignore[union-attr]
+            fig_track.data[i + 1].showlegend = True  # type: ignore[union-attr]
+
+        # Animation frames
+        plotly_frames: list[go.Frame] = []
+        for frame in track_map.frames:
+            pos_map = {dp.acronym: dp for dp in frame.driver_positions}
+            plotly_frames.append(go.Frame(
+                data=_build_frame_traces(pos_map),
+                layout=go.Layout(annotations=_build_frame_annotations(frame.t, pos_map)),
+                name=f"{frame.t:.2f}",
+            ))
 
         fig_track.frames = plotly_frames
 
+        # Slider for scrubbing through the lap
+        sliders = [dict(
+            active=0,
+            steps=[
+                dict(args=[[f.name], dict(frame=dict(duration=0, redraw=True), mode="immediate")],
+                     method="animate", label="")
+                for f in plotly_frames
+            ],
+            x=0.05, len=0.9,
+            xanchor="left",
+            y=-0.02,
+            currentvalue=dict(prefix="", visible=False),
+            transition=dict(duration=0),
+            pad=dict(b=10),
+        )]
+
         fig_track.update_layout(
             **PLOTLY_LAYOUT_DEFAULTS,
-            height=600,
+            height=650,
             xaxis=dict(scaleanchor="y", visible=False),
             yaxis=dict(visible=False),
+            annotations=_build_frame_annotations(0.0, first_positions),
+            sliders=sliders,
             updatemenus=[dict(
                 type="buttons",
                 showactive=False,
-                y=0,
+                y=-0.06,
                 x=0.5,
                 xanchor="center",
                 buttons=[
                     dict(label="Play", method="animate", args=[
                         None,
-                        dict(frame=dict(duration=track_map.frame_interval_ms, redraw=True), fromcurrent=True),
+                        dict(
+                            frame=dict(duration=track_map.frame_interval_ms, redraw=True),
+                            fromcurrent=True,
+                            transition=dict(duration=0),
+                        ),
                     ]),
                     dict(label="Pause", method="animate", args=[
                         [None],

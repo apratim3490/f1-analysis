@@ -17,6 +17,8 @@ from shared.services.driver_comparison import (
     TelemetryPoint,
     TrackMapData,
     _estimate_stint_temperature,
+    _interpolate_position,
+    _interpolate_speed,
 )
 
 
@@ -478,3 +480,92 @@ class TestComputeTrackMap:
         assert "VER" in result.driver_colors
         assert "HAM" in result.driver_colors
         assert result.lap_duration > 0
+
+    def test_frames_have_speed(self):
+        location = [
+            {"t": float(i), "x": float(i * 10), "y": float(i * 20), "z": 0.0}
+            for i in range(10)
+        ]
+        car = [
+            {"t": float(i), "speed": 100 + i * 10, "rpm": 10000, "throttle": 100, "brake": 0, "n_gear": 5, "drs": 0}
+            for i in range(10)
+        ]
+        telemetry = {
+            1: {"car": car, "location": location, "acronym": "VER", "color": "#3671C6"},
+        }
+        result = DriverComparisonService.compute_track_map(telemetry)
+
+        assert result is not None
+        # Check that positions have speed values
+        mid_frame = result.frames[len(result.frames) // 2]
+        assert len(mid_frame.driver_positions) == 1
+        assert mid_frame.driver_positions[0].speed > 0
+
+
+class TestInterpolatePosition:
+    def test_exact_match(self):
+        loc = [
+            {"t": 0.0, "x": 0.0, "y": 0.0, "z": 0.0},
+            {"t": 1.0, "x": 10.0, "y": 20.0, "z": 0.0},
+        ]
+        result = _interpolate_position(loc, 1.0)
+        assert result == (10.0, 20.0)
+
+    def test_midpoint_interpolation(self):
+        loc = [
+            {"t": 0.0, "x": 0.0, "y": 0.0, "z": 0.0},
+            {"t": 2.0, "x": 10.0, "y": 20.0, "z": 0.0},
+        ]
+        result = _interpolate_position(loc, 1.0)
+        assert result is not None
+        assert result[0] == pytest.approx(5.0)
+        assert result[1] == pytest.approx(10.0)
+
+    def test_clamp_before_start(self):
+        loc = [
+            {"t": 1.0, "x": 5.0, "y": 10.0, "z": 0.0},
+            {"t": 2.0, "x": 15.0, "y": 20.0, "z": 0.0},
+        ]
+        result = _interpolate_position(loc, 0.8)
+        assert result == (5.0, 10.0)
+
+    def test_clamp_after_end(self):
+        loc = [
+            {"t": 0.0, "x": 0.0, "y": 0.0, "z": 0.0},
+            {"t": 1.0, "x": 10.0, "y": 20.0, "z": 0.0},
+        ]
+        result = _interpolate_position(loc, 1.2)
+        assert result == (10.0, 20.0)
+
+    def test_none_for_empty(self):
+        assert _interpolate_position([], 1.0) is None
+
+    def test_none_far_outside_range(self):
+        loc = [{"t": 5.0, "x": 0.0, "y": 0.0, "z": 0.0}]
+        assert _interpolate_position(loc, 0.0) is None
+
+
+class TestInterpolateSpeed:
+    def test_nearest_before(self):
+        car = [
+            {"t": 0.0, "speed": 100, "rpm": 10000},
+            {"t": 1.0, "speed": 200, "rpm": 11000},
+        ]
+        assert _interpolate_speed(car, 0.3) == 100
+
+    def test_nearest_after(self):
+        car = [
+            {"t": 0.0, "speed": 100, "rpm": 10000},
+            {"t": 1.0, "speed": 200, "rpm": 11000},
+        ]
+        assert _interpolate_speed(car, 0.7) == 200
+
+    def test_empty_returns_zero(self):
+        assert _interpolate_speed([], 1.0) == 0
+
+    def test_clamp_to_last(self):
+        car = [
+            {"t": 0.0, "speed": 150, "rpm": 10000},
+            {"t": 1.0, "speed": 250, "rpm": 11000},
+        ]
+        assert _interpolate_speed(car, 5.0) == 250
