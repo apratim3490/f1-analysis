@@ -27,6 +27,9 @@ dashboard = [
     "streamlit>=1.38",
     "plotly>=5.22",
 ]
+fastf1 = [
+    "fastf1>=3.3",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

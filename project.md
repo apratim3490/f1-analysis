@@ -2,9 +2,28 @@
 
 ## Purpose
 
-A fully-typed Python client library for the [OpenF1 API](https://openf1.org) with a multi-page Streamlit dashboard for visualizing Formula 1 performance data. The client provides ergonomic access to all 18 endpoints covering telemetry, timing, sessions, and standings data from 2023 onwards. No authentication required.
+A fully-typed Python client library for the [OpenF1 API](https://openf1.org) with a multi-page Streamlit dashboard for visualizing Formula 1 performance data. The client provides ergonomic access to all 18 endpoints covering telemetry, timing, sessions, and standings data from 2023 onwards. No authentication required. The dashboard supports both OpenF1 and FastF1 as data backends.
 
 ## Architecture
+
+### 3-Tier Dashboard Architecture
+
+```
+UI Layer (app.py, pages/2_Driver_Comparison.py)
+  → only Streamlit widgets + Plotly charts
+  → catches F1DataError (generic)
+
+Service Layer (shared/services/)
+  → all business logic, KPI computation, aggregations
+  → returns frozen dataclasses
+
+Data Layer (shared/data/)
+  → source-agnostic repository interface
+  → OpenF1 + FastF1 implementations
+  → all calls logged to dashboard/logs/api_calls.log
+```
+
+### File Structure
 
 ```
 src/openf1/                          # Python client library
@@ -14,35 +33,32 @@ src/openf1/                          # Python client library
 ├── _filters.py                      # Query filter builder (equality, gt, gte, lt, lte)
 ├── exceptions.py                    # Exception hierarchy (connection, timeout, API, validation)
 └── models/                          # 16 frozen Pydantic v2 models
-    ├── car_data.py                  # Vehicle telemetry (~3.7 Hz)
-    ├── championship.py              # Driver + team standings
-    ├── driver.py                    # Driver info per session
-    ├── interval.py                  # Gaps between drivers
-    ├── lap.py                       # Sector times, speeds, segments
-    ├── location.py                  # 3D car positions on track
-    ├── meeting.py                   # Grand Prix weekends
-    ├── overtake.py                  # Position changes
-    ├── pit.py                       # Pit stop durations
-    ├── position.py                  # Position timeline
-    ├── race_control.py              # Flags, safety cars, incidents
-    ├── session.py                   # Practice, qualifying, sprint, race
-    ├── session_result.py            # Final standings (DNF/DNS/DSQ)
-    ├── starting_grid.py             # Grid positions
-    ├── stint.py                     # Tire compounds and ages
-    ├── team_radio.py                # Audio recording URLs
-    └── weather.py                   # Temperature, wind, humidity, rainfall
 
 dashboard/                           # Streamlit multi-page dashboard
-├── app.py                           # Main page — single-driver performance analysis
+├── app.py                           # Main page — single-driver performance analysis (UI only)
+├── logs/                            # API call log output (.gitignore'd)
 ├── shared/                          # Shared utilities across pages
-│   ├── __init__.py                  # Re-exports all shared symbols
+│   ├── __init__.py                  # Re-exports all shared symbols (grouped by concern)
 │   ├── constants.py                 # F1_RED, COMPOUND_COLORS, PLOTLY_LAYOUT_DEFAULTS, etc.
 │   ├── formatters.py                # format_lap_time(), format_delta()
-│   ├── data_helpers.py              # Stint summarisation, compound lookup
-│   ├── fetchers.py                  # @st.cache_data API fetchers + rate limiter
-│   └── sidebar.py                   # render_session_sidebar() — shared session cascade
+│   ├── api_logging.py               # File logger + @log_api_call / @log_service_call decorators
+│   ├── sidebar.py                   # render_session_sidebar() — shared session cascade
+│   ├── data/                        # Data Layer — source-agnostic repositories
+│   │   ├── __init__.py              # get_repository() factory, re-exports
+│   │   ├── errors.py                # F1DataError (source-agnostic exception)
+│   │   ├── types.py                 # TypedDict contracts for all data shapes
+│   │   ├── base.py                  # ABC: F1DataRepository (7 abstract methods)
+│   │   ├── source.py                # DataSource enum, get_active_source(), fastf1_available()
+│   │   ├── openf1_repo.py           # OpenF1 API implementation (with @st.cache_data)
+│   │   └── fastf1_repo.py           # FastF1 implementation (with @st.cache_resource)
+│   └── services/                    # Service Layer — business logic
+│       ├── __init__.py              # Re-exports
+│       ├── common.py                # Shared pure functions (lap filtering, color assignment)
+│       ├── stint_helpers.py          # Stint summarisation, compound lookup
+│       ├── driver_performance.py    # Single-driver: KPIs, lap progression, sectors, speed traps
+│       └── driver_comparison.py     # Multi-driver: best laps, stint comparison, speed traps
 └── pages/
-    └── 2_Driver_Comparison.py       # Compare up to 4 drivers side-by-side
+    └── 2_Driver_Comparison.py       # Compare up to 4 drivers side-by-side (UI only)
 ```
 
 ## Dashboard
@@ -64,44 +80,63 @@ dashboard/                           # Streamlit multi-page dashboard
 - Stint comparison table (top 3 consistent stints, std dev < 2s) with sector averages
 - Speed trap grouped bar chart (max I1/I2/ST per driver)
 - Sector time stacked bar (S1/S2/S3 from each driver's fastest lap)
+- Track map animation (best lap overlay with Play/Pause, real-time playback, equal aspect ratio)
+- Speed vs Time line chart (best lap telemetry per driver)
+- RPM vs Time line chart (best lap telemetry per driver)
+
+### Data Layer
+
+The `shared/data/` package provides a source-agnostic repository interface:
+- **F1DataRepository** (ABC): 9 abstract methods (get_meetings, get_sessions, get_drivers, get_laps, get_all_laps, get_stints, get_pits, get_car_telemetry, get_location)
+- **OpenF1Repository**: Uses OpenF1Client with 350ms rate limiting and @st.cache_data
+- **FastF1Repository**: Uses fastf1 library with @st.cache_resource for session loading, includes telemetry via `lap.get_telemetry()`
+- **F1DataError**: Generic exception caught by all UI layers (replaces OpenF1Error)
+- **DataSource** (`data/source.py`): Enum for backend selection (OpenF1/FastF1) with session state integration
+- **TypedDict contracts**: DriverInfo, LapData, StintData, PitData, MeetingData, SessionData, CarTelemetry, LocationPoint
+- **API call logging**: All data and service calls logged to `dashboard/logs/api_calls.log` via `shared/api_logging.py`
+
+### Service Layer
+
+The `shared/services/` package encapsulates all business logic:
+- **DriverPerformanceService**: KPIs, lap progression, sector breakdown, speed traps, stint summaries
+- **DriverComparisonService**: Best laps, stint comparison with insights, speed trap comparison, sector comparison, telemetry traces (speed/RPM), track map animation
+- **common.py**: Pure functions for lap filtering, color assignment, speed stats, ideal lap computation
+- All service methods return frozen dataclasses for immutability
 
 ### Shared Module
 
-The `dashboard/shared/` package extracts common functionality:
-- **Fetchers**: 7 cached API functions with 350ms rate limiting for OpenF1's 3 req/s limit
-- **Sidebar**: Reusable year → meeting → session → drivers cascade
-- **Data helpers**: `summarise_stints()` and `summarise_stints_with_sectors()` with edge-lap outlier trimming
+- **Sidebar**: Reusable year → meeting → session → drivers cascade (uses repository)
+- **Stint helpers** (`services/stint_helpers.py`): `summarise_stints()` and `summarise_stints_with_sectors()` with edge-lap outlier trimming
+- **API logging** (`api_logging.py`): Cross-cutting file logger with `@log_api_call` and `@log_service_call` decorators
 - **Color handling**: Teammate disambiguation via `COMPARISON_COLORS` fallback palette
 
 ## Data Flow
 
 ```
 User code / Dashboard
-  → OpenF1Client / AsyncOpenF1Client  (client.py)
-    → build_query_params()             (_filters.py — Filter objects to query tuples)
-    → SyncTransport / AsyncTransport   (_http.py — httpx GET with error mapping)
-      → OpenF1 REST API                (https://api.openf1.org/v1)
-    → Pydantic TypeAdapter.validate    (models/ — JSON → frozen model instances)
-  ← list[Model]
-
-Dashboard fetchers (@st.cache_data, TTL=600s)
-  → _rate_limit() — 350ms spacing
-  → OpenF1Client context manager
-  → model_dump() to plain dicts for Streamlit serialization
+  → Service Layer (business logic, KPIs, aggregations)
+    → Data Layer (F1DataRepository interface)
+      → OpenF1Repository / FastF1Repository
+        → OpenF1 REST API / FastF1 library
+      → @log_api_call → dashboard/logs/api_calls.log
+    → @log_service_call → dashboard/logs/api_calls.log
+  ← Frozen dataclasses / TypedDict data
 ```
 
 ## Key Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
+| Architecture | 3-tier (UI → Service → Data) | Separation of concerns, testable business logic |
+| Data access | Repository pattern (ABC) | Source-agnostic, swappable backends |
+| Error handling | F1DataError (generic) | UI doesn't depend on specific backend exceptions |
+| Data contracts | TypedDict | Lightweight, IDE-friendly, no runtime overhead |
+| Service returns | Frozen dataclasses | Immutable, typed, structured results |
+| API logging | File-based (@log_api_call) | Observability without external dependencies |
 | HTTP client | httpx | Built-in sync + async, connection pooling |
 | Data models | Pydantic v2 (frozen) | Validation, immutability, JSON parsing |
-| Filter API | `Filter(gte=X, lte=Y)` dataclass | Ergonomic comparison operators alongside simple `key=value` equality |
-| Project layout | `src/` layout | Prevents accidental imports from project root |
-| Error handling | Custom exception hierarchy | Maps httpx errors to domain-specific exceptions |
 | Dashboard framework | Streamlit | Rapid prototyping, built-in caching, multi-page support |
 | Charts | Plotly | Interactive, dark-theme compatible, rich hover tooltips |
-| Dashboard shared module | `dashboard/shared/` package | DRY across pages, shared caching and rate limiting |
 
 ## Dependencies
 
@@ -112,6 +147,7 @@ Dashboard fetchers (@st.cache_data, TTL=600s)
 ### Dashboard
 - `streamlit >= 1.38` — Web UI framework
 - `plotly >= 5.22` — Interactive charts
+- `fastf1` (optional) — Alternative data backend
 
 ### Development
 - `pytest >= 8.0` + `respx >= 0.21` — Testing with httpx mocking
@@ -122,14 +158,9 @@ Dashboard fetchers (@st.cache_data, TTL=600s)
 
 ## Testing
 
-- **61 tests** across 4 test files (client library)
-- **94% code coverage**
-- Test categories: filters (unit), HTTP transport (mocked), models (deserialization), client (integration with mocked API)
+- **173 tests** across client library (`tests/openf1/`) and dashboard (`tests/dashboard/`)
+- Test categories: filters (unit), HTTP transport (mocked), models (deserialization), client (integration with mocked API), dashboard services, data layer, stint helpers, logging
 - Async tests via `pytest-asyncio` with `asyncio_mode = auto`
-
-## API Endpoints (18 total)
-
-`car_data`, `championship_drivers`, `championship_teams`, `drivers`, `intervals`, `laps`, `location`, `meetings`, `overtakes`, `pit`, `position`, `race_control`, `sessions`, `session_result`, `starting_grid`, `stints`, `team_radio`, `weather`
 
 ## Quick Start
 

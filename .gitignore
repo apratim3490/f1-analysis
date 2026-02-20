@@ -19,6 +19,7 @@ htmlcov/
 coverage.xml
 
 *.log
+dashboard/logs/
 .env
 .idea/
 .vscode/

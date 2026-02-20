@@ -1,4 +1,4 @@
-"""Data processing helpers for the F1 dashboard."""
+"""Stint summarisation and compound lookup helpers for the F1 dashboard."""
 
 from __future__ import annotations
 
