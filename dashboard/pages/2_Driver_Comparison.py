@@ -440,18 +440,22 @@ if telemetry_data:
         fig_track.frames = plotly_frames
 
         # Slider for scrubbing through the lap
+        _fd = track_map.frame_interval_ms
         sliders = [dict(
             active=0,
             steps=[
-                dict(args=[[f.name], dict(frame=dict(duration=0, redraw=True), mode="immediate")],
-                     method="animate", label="")
+                dict(args=[[f.name], dict(
+                    frame=dict(duration=_fd, redraw=True),
+                    mode="immediate",
+                    transition=dict(duration=_fd, easing="linear"),
+                )], method="animate", label="")
                 for f in plotly_frames
             ],
             x=0.05, len=0.9,
             xanchor="left",
             y=-0.02,
             currentvalue=dict(prefix="", visible=False),
-            transition=dict(duration=0),
+            transition=dict(duration=_fd, easing="linear"),
             pad=dict(b=10),
         )]
 
@@ -472,9 +476,9 @@ if telemetry_data:
                     dict(label="Play", method="animate", args=[
                         None,
                         dict(
-                            frame=dict(duration=track_map.frame_interval_ms, redraw=True),
+                            frame=dict(duration=_fd, redraw=True),
                             fromcurrent=True,
-                            transition=dict(duration=0),
+                            transition=dict(duration=_fd, easing="linear"),
                         ),
                     ]),
                     dict(label="Pause", method="animate", args=[
