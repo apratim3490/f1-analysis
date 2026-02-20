@@ -17,6 +17,23 @@ def get_compound_for_lap(lap_number: int, stints: list[dict]) -> str:
     return "UNKNOWN"
 
 
+def get_tyre_age_for_lap(lap_number: int, stints: list[dict]) -> int | None:
+    """Return the tyre age (in laps) at the given lap number.
+
+    Tyre age = tyre_age_at_start + (lap_number - lap_start).
+    Returns None if no matching stint is found.
+    """
+    for stint in stints:
+        lap_start = stint.get("lap_start")
+        lap_end = stint.get("lap_end")
+        if lap_start is None or lap_end is None:
+            continue
+        if lap_start <= lap_number <= lap_end:
+            age_at_start = stint.get("tyre_age_at_start", 0)
+            return age_at_start + (lap_number - lap_start)
+    return None
+
+
 def _compute_stint_clean_laps(
     laps: list[dict],
     stint: dict,

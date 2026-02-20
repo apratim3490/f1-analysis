@@ -9,7 +9,7 @@ from ..data.base import F1DataRepository
 from ..data.errors import F1DataError
 from ..data.types import CarTelemetry, LocationPoint
 from ..api_logging import log_service_call
-from .stint_helpers import summarise_stints_with_sectors
+from .stint_helpers import get_compound_for_lap, get_tyre_age_for_lap, summarise_stints_with_sectors
 from ..formatters import format_delta, format_lap_time
 from .common import compute_ideal_lap, compute_session_best, filter_valid_laps
 
@@ -20,6 +20,9 @@ class DriverBestLap:
     best_lap: float | None
     ideal_lap: float | None
     delta: str | None
+    compound: str | None = None
+    tyre_age: int | None = None
+    track_temp: float | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,12 @@ class DriverTelemetryTrace:
     acronym: str
     color: str
     points: tuple[TelemetryPoint, ...]
+
+
+@dataclass(frozen=True)
+class DeltaComparisonData:
+    reference_acronym: str
+    traces: tuple[DriverTelemetryTrace, ...]
 
 
 @dataclass(frozen=True)
@@ -199,6 +208,158 @@ def _interpolate_speed(car: list[CarTelemetry], t: float) -> int:
     return p_after["speed"]
 
 
+def _interpolate_speed_linear(car: list[CarTelemetry], t: float) -> float:
+    """Linearly interpolate speed at time t from sorted car telemetry.
+
+    Unlike _interpolate_speed (nearest-neighbor, int), this returns a smooth
+    float value suitable for computing deltas.
+    """
+    if not car:
+        return 0.0
+
+    first_t, last_t = car[0]["t"], car[-1]["t"]
+    if t <= first_t:
+        return float(car[0]["speed"])
+    if t >= last_t:
+        return float(car[-1]["speed"])
+
+    idx = _bisect_right_by_time(car, t)  # type: ignore[arg-type]
+    p_after = car[idx]
+    p_before = car[idx - 1]
+
+    dt = p_after["t"] - p_before["t"]
+    if dt <= 0:
+        return float(p_before["speed"])
+
+    frac = (t - p_before["t"]) / dt
+    return p_before["speed"] + frac * (p_after["speed"] - p_before["speed"])
+
+
+def _sort_car_by_time(car: list[CarTelemetry]) -> list[CarTelemetry]:
+    """Return car telemetry sorted by time. Needed because API order is not guaranteed."""
+    return sorted(car, key=lambda p: p["t"])
+
+
+def _build_common_time_grid(telemetry_data: dict[int, dict]) -> list[float]:
+    """Build a common time grid over the overlapping range of all drivers.
+
+    Samples at 0.1s intervals for smooth delta curves.
+    """
+    starts: list[float] = []
+    ends: list[float] = []
+    for data in telemetry_data.values():
+        car: list[CarTelemetry] = data["car"]
+        if car:
+            starts.append(min(p["t"] for p in car))
+            ends.append(max(p["t"] for p in car))
+
+    if not starts or not ends:
+        return []
+
+    t_start = max(starts)
+    t_end = min(ends)
+    if t_end <= t_start:
+        return []
+
+    grid: list[float] = []
+    t = t_start
+    while t <= t_end:
+        grid.append(round(t, 1))
+        t += 0.1
+    return grid
+
+
+def _compute_distance_profile(car: list[CarTelemetry]) -> list[tuple[float, float]]:
+    """Integrate speed over time to get cumulative distance.
+
+    Uses trapezoidal rule. Speed is in km/h, converted to m/s.
+    Returns list of (time, cumulative_distance_meters) pairs.
+    """
+    if not car:
+        return []
+
+    KMH_TO_MS = 1000.0 / 3600.0
+    profile: list[tuple[float, float]] = [(car[0]["t"], 0.0)]
+    cumulative = 0.0
+
+    for i in range(1, len(car)):
+        dt = car[i]["t"] - car[i - 1]["t"]
+        if dt <= 0:
+            profile.append((car[i]["t"], cumulative))
+            continue
+        v_prev = car[i - 1]["speed"] * KMH_TO_MS
+        v_curr = car[i]["speed"] * KMH_TO_MS
+        cumulative += (v_prev + v_curr) / 2.0 * dt
+        profile.append((car[i]["t"], cumulative))
+
+    return profile
+
+
+def _interpolate_time_at_distance(
+    profile: list[tuple[float, float]], target_dist: float,
+) -> float | None:
+    """Binary search + linear interpolation to find time at a given distance.
+
+    Returns None if distance is outside the profile range.
+    """
+    if not profile:
+        return None
+
+    if target_dist < profile[0][1] or target_dist > profile[-1][1]:
+        return None
+
+    # Binary search for the interval containing target_dist
+    lo, hi = 0, len(profile) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if profile[mid][1] <= target_dist:
+            lo = mid
+        else:
+            hi = mid
+
+    t0, d0 = profile[lo]
+    t1, d1 = profile[hi]
+    dd = d1 - d0
+    if dd <= 0:
+        return t0
+
+    frac = (target_dist - d0) / dd
+    return t0 + frac * (t1 - t0)
+
+
+def _interpolate_distance_at_time(
+    profile: list[tuple[float, float]], target_t: float,
+) -> float | None:
+    """Linear interpolation to find cumulative distance at a given time.
+
+    Profile is a list of (time, distance) pairs sorted by time.
+    Returns None if time is outside the profile range.
+    """
+    if not profile:
+        return None
+
+    if target_t < profile[0][0] or target_t > profile[-1][0]:
+        return None
+
+    # Binary search for the interval containing target_t
+    lo, hi = 0, len(profile) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if profile[mid][0] <= target_t:
+            lo = mid
+        else:
+            hi = mid
+
+    t0, d0 = profile[lo]
+    t1, d1 = profile[hi]
+    dt = t1 - t0
+    if dt <= 0:
+        return d0
+
+    frac = (target_t - t0) / dt
+    return d0 + frac * (d1 - d0)
+
+
 class DriverComparisonService:
     """Encapsulates all business logic for multi-driver comparison."""
 
@@ -238,23 +399,66 @@ class DriverComparisonService:
         driver_data: dict[int, dict],
         all_laps: list[dict],
         drivers: list[dict],
+        weather: list[dict] | None = None,
     ) -> list[DriverBestLap]:
         """Compute best lap and ideal lap for each selected driver."""
         session_best = compute_session_best(all_laps)
+
+        # Total laps across all drivers (for proportional weather mapping)
+        total_laps = 0
+        if weather:
+            for d in drivers:
+                dn = d["driver_number"]
+                for stint in driver_data[dn]["stints"]:
+                    lap_end = stint.get("lap_end", 0)
+                    if lap_end > total_laps:
+                        total_laps = lap_end
+
         results: list[DriverBestLap] = []
 
         for d in drivers:
             dn = d["driver_number"]
             d_laps = driver_data[dn]["laps"]
             valid = filter_valid_laps(d_laps)
-            best = min((lap["lap_duration"] for lap in valid), default=None)
+
+            if not valid:
+                results.append(DriverBestLap(
+                    acronym=d.get("name_acronym", "???"),
+                    best_lap=None,
+                    ideal_lap=compute_ideal_lap(d_laps),
+                    delta=format_delta(None, session_best),
+                ))
+                continue
+
+            best_lap_obj = min(valid, key=lambda l: l["lap_duration"])
+            best = best_lap_obj["lap_duration"]
             ideal = compute_ideal_lap(d_laps)
+            lap_num = best_lap_obj.get("lap_number")
+
+            # Look up compound and tyre age from stints
+            stints = driver_data[dn]["stints"]
+            compound: str | None = None
+            tyre_age: int | None = None
+            if lap_num is not None and stints:
+                raw_compound = get_compound_for_lap(lap_num, stints)
+                compound = raw_compound if raw_compound != "UNKNOWN" else None
+                tyre_age = get_tyre_age_for_lap(lap_num, stints)
+
+            # Estimate track temperature at best lap
+            track_temp: float | None = None
+            if weather and lap_num is not None and total_laps > 0:
+                track_temp = _estimate_stint_temperature(
+                    weather, lap_num, lap_num, total_laps,
+                )
 
             results.append(DriverBestLap(
                 acronym=d.get("name_acronym", "???"),
                 best_lap=best,
                 ideal_lap=ideal,
                 delta=format_delta(best, session_best),
+                compound=compound,
+                tyre_age=tyre_age,
+                track_temp=track_temp,
             ))
 
         return results
@@ -576,6 +780,180 @@ class DriverComparisonService:
                 points=points,
             ))
         return traces
+
+    @staticmethod
+    def compute_speed_delta(
+        telemetry_data: dict[int, dict],
+    ) -> DeltaComparisonData | None:
+        """Compute speed difference vs reference driver over track position.
+
+        Reference = driver with most car data points.
+        At each distance point, finds each driver's time at that distance,
+        then looks up their speed.  value = speed_compared - speed_ref.
+        Positive means the compared driver is faster at that track position.
+        """
+        if len(telemetry_data) < 2:
+            return None
+
+        # Pick reference = driver with most car data points
+        ref_dn = max(
+            telemetry_data,
+            key=lambda dn: len(telemetry_data[dn]["car"]),
+        )
+        ref_car = _sort_car_by_time(telemetry_data[ref_dn]["car"])
+        if not ref_car:
+            return None
+
+        ref_profile = _compute_distance_profile(ref_car)
+        if not ref_profile:
+            return None
+
+        ref_acronym: str = telemetry_data[ref_dn]["acronym"]
+
+        # Pre-compute sorted car data and distance profiles
+        sorted_cars: dict[int, list[CarTelemetry]] = {ref_dn: ref_car}
+        profiles: dict[int, list[tuple[float, float]]] = {ref_dn: ref_profile}
+        for dn, data in telemetry_data.items():
+            if dn == ref_dn:
+                continue
+            car = _sort_car_by_time(data["car"])
+            if car:
+                sorted_cars[dn] = car
+                profiles[dn] = _compute_distance_profile(car)
+
+        # Distance grid over the shared range (every 10m)
+        min_max_dist = min(
+            prof[-1][1] for prof in profiles.values() if prof
+        )
+        dist_grid: list[float] = []
+        d = 0.0
+        while d <= min_max_dist:
+            dist_grid.append(round(d, 1))
+            d += 10.0
+
+        if not dist_grid:
+            return None
+
+        traces: list[DriverTelemetryTrace] = []
+        for dn, data in telemetry_data.items():
+            if dn == ref_dn:
+                continue
+            if dn not in profiles or not profiles[dn]:
+                continue
+
+            cmp_car = sorted_cars[dn]
+            cmp_profile = profiles[dn]
+            points: list[TelemetryPoint] = []
+            for dist in dist_grid:
+                t_ref = _interpolate_time_at_distance(ref_profile, dist)
+                t_cmp = _interpolate_time_at_distance(cmp_profile, dist)
+                if t_ref is None or t_cmp is None:
+                    continue
+                speed_ref = _interpolate_speed_linear(ref_car, t_ref)
+                speed_cmp = _interpolate_speed_linear(cmp_car, t_cmp)
+                points.append(TelemetryPoint(
+                    t=dist, value=round(speed_cmp - speed_ref, 2),
+                ))
+
+            if points:
+                traces.append(DriverTelemetryTrace(
+                    acronym=data["acronym"],
+                    color=data["color"],
+                    points=tuple(points),
+                ))
+
+        if not traces:
+            return None
+
+        return DeltaComparisonData(
+            reference_acronym=ref_acronym,
+            traces=tuple(traces),
+        )
+
+    @staticmethod
+    def compute_time_delta(
+        telemetry_data: dict[int, dict],
+    ) -> DeltaComparisonData | None:
+        """Compute cumulative time delta vs reference driver over lap time.
+
+        Reference = driver with most car data points.
+        At each time t on the reference's timeline, find the distance covered
+        by the reference, then find how long the compared driver took to cover
+        that same distance.  delta = t_compared - t.
+        Positive means the compared driver is behind (losing time).
+        """
+        if len(telemetry_data) < 2:
+            return None
+
+        # Pick reference = driver with most car data points
+        ref_dn = max(
+            telemetry_data,
+            key=lambda dn: len(telemetry_data[dn]["car"]),
+        )
+        ref_car = _sort_car_by_time(telemetry_data[ref_dn]["car"])
+        if not ref_car:
+            return None
+
+        ref_profile = _compute_distance_profile(ref_car)
+        if not ref_profile:
+            return None
+
+        ref_acronym: str = telemetry_data[ref_dn]["acronym"]
+
+        # Pre-compute profiles for all drivers (sorted by time)
+        profiles: dict[int, list[tuple[float, float]]] = {ref_dn: ref_profile}
+        for dn, data in telemetry_data.items():
+            if dn == ref_dn:
+                continue
+            car = _sort_car_by_time(data["car"])
+            if car:
+                profiles[dn] = _compute_distance_profile(car)
+
+        # Build a time grid over the reference driver's lap (0.1s intervals)
+        ref_t_end = ref_profile[-1][0]
+        time_grid: list[float] = []
+        t = 0.0
+        while t <= ref_t_end:
+            time_grid.append(round(t, 1))
+            t += 0.1
+
+        if not time_grid:
+            return None
+
+        traces: list[DriverTelemetryTrace] = []
+        for dn, data in telemetry_data.items():
+            if dn == ref_dn:
+                continue
+            if dn not in profiles or not profiles[dn]:
+                continue
+
+            cmp_profile = profiles[dn]
+            points: list[TelemetryPoint] = []
+            for t in time_grid:
+                # Distance covered by reference at time t
+                d_ref = _interpolate_distance_at_time(ref_profile, t)
+                if d_ref is None:
+                    continue
+                # Time for compared driver to cover that same distance
+                t_cmp = _interpolate_time_at_distance(cmp_profile, d_ref)
+                if t_cmp is None:
+                    continue
+                points.append(TelemetryPoint(t=t, value=round(t_cmp - t, 4)))
+
+            if points:
+                traces.append(DriverTelemetryTrace(
+                    acronym=data["acronym"],
+                    color=data["color"],
+                    points=tuple(points),
+                ))
+
+        if not traces:
+            return None
+
+        return DeltaComparisonData(
+            reference_acronym=ref_acronym,
+            traces=tuple(traces),
+        )
 
     @staticmethod
     def compute_track_map(

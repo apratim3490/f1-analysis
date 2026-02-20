@@ -6,6 +6,7 @@ import pytest
 
 from shared.services.stint_helpers import (
     get_compound_for_lap,
+    get_tyre_age_for_lap,
     summarise_stints,
     summarise_stints_with_sectors,
 )
@@ -23,6 +24,31 @@ class TestGetCompoundForLap:
 
     def test_empty_stints(self):
         assert get_compound_for_lap(1, []) == "UNKNOWN"
+
+
+class TestGetTyreAgeForLap:
+    def test_mid_stint(self, sample_stints):
+        # Stint 1: SOFT, laps 1-5, tyre_age_at_start=0
+        # Lap 3 → age = 0 + (3 - 1) = 2
+        assert get_tyre_age_for_lap(3, sample_stints) == 2
+
+    def test_first_lap_of_stint(self, sample_stints):
+        assert get_tyre_age_for_lap(1, sample_stints) == 0
+
+    def test_last_lap_of_stint(self, sample_stints):
+        # Stint 1: laps 1-5, age_at_start=0 → lap 5 age = 4
+        assert get_tyre_age_for_lap(5, sample_stints) == 4
+
+    def test_used_tyres(self, make_stint):
+        stints = [make_stint(1, "HARD", 10, 20, tyre_age=5)]
+        # Lap 15 → age = 5 + (15 - 10) = 10
+        assert get_tyre_age_for_lap(15, stints) == 10
+
+    def test_no_matching_stint(self, sample_stints):
+        assert get_tyre_age_for_lap(99, sample_stints) is None
+
+    def test_empty_stints(self):
+        assert get_tyre_age_for_lap(1, []) is None
 
 
 class TestSummariseStints:

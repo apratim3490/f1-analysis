@@ -108,13 +108,23 @@ for i, d in enumerate(selected_drivers):
 
 st.subheader("Best Lap Time")
 
-best_laps = service.compute_best_laps(driver_data, all_laps, selected_drivers)
+best_laps = service.compute_best_laps(driver_data, all_laps, selected_drivers, weather)
 metric_cols = st.columns(len(selected_drivers))
 for i, bl in enumerate(best_laps):
     with metric_cols[i]:
         st.metric(bl.acronym, format_lap_time(bl.best_lap), delta=bl.delta)
         if bl.ideal_lap is not None:
             st.caption(f"Ideal: {format_lap_time(bl.ideal_lap)}")
+        context_parts: list[str] = []
+        if bl.compound is not None:
+            tyre_label = bl.compound
+            if bl.tyre_age is not None:
+                tyre_label += f" (lap {bl.tyre_age})"
+            context_parts.append(tyre_label)
+        if bl.track_temp is not None:
+            context_parts.append(f"{bl.track_temp:.1f}\u00b0C")
+        if context_parts:
+            st.caption(" \u00b7 ".join(context_parts))
 
 
 # ── C. Stint Comparison ─────────────────────────────────────────────────────
@@ -547,6 +557,83 @@ if telemetry_data:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(fig_rpm, use_container_width=True)
+
+    # ── F4. Speed Delta ────────────────────────────────────────────────
+
+    speed_delta = DriverComparisonService.compute_speed_delta(telemetry_data)
+
+    if speed_delta is not None:
+        st.subheader("Speed Delta (Best Lap)")
+        st.caption(f"Reference: {speed_delta.reference_acronym} — positive = compared driver is faster")
+
+        fig_speed_delta = go.Figure()
+
+        for trace in speed_delta.traces:
+            fig_speed_delta.add_trace(go.Scatter(
+                x=[p.t for p in trace.points],
+                y=[p.value for p in trace.points],
+                mode="lines",
+                name=trace.acronym,
+                line=dict(color=trace.color, width=2),
+                hovertemplate="%{y:+.0f} km/h at %{x:.0f}m<extra></extra>",
+            ))
+
+        fig_speed_delta.update_layout(
+            **PLOTLY_LAYOUT_DEFAULTS,
+            height=400,
+            xaxis_title="Track Position (m)",
+            yaxis_title="Speed Delta (km/h)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            shapes=[dict(
+                type="line", y0=0, y1=0, x0=0, x1=1,
+                xref="paper", yref="y",
+                line=dict(color="#888888", width=1, dash="dash"),
+            )],
+        )
+        st.plotly_chart(fig_speed_delta, use_container_width=True)
+
+    # ── F5. Time Gained/Lost ───────────────────────────────────────────
+
+    time_delta = DriverComparisonService.compute_time_delta(telemetry_data)
+
+    if time_delta is not None:
+        st.subheader("Time Gained / Lost (Best Lap)")
+        st.caption(
+            f"Reference: {time_delta.reference_acronym} — "
+            "positive = compared driver is losing time"
+        )
+
+        fig_time_delta = go.Figure()
+
+        for trace in time_delta.traces:
+            fig_time_delta.add_trace(go.Scatter(
+                x=[p.t for p in trace.points],
+                y=[p.value for p in trace.points],
+                mode="lines",
+                name=trace.acronym,
+                line=dict(color=trace.color, width=2),
+                fill="tozeroy",
+                fillcolor=(
+                    f"rgba({int(trace.color[1:3], 16)}, "
+                    f"{int(trace.color[3:5], 16)}, "
+                    f"{int(trace.color[5:7], 16)}, 0.15)"
+                ),
+                hovertemplate="%{y:+.3f}s at %{x:.1f}s<extra></extra>",
+            ))
+
+        fig_time_delta.update_layout(
+            **PLOTLY_LAYOUT_DEFAULTS,
+            height=400,
+            xaxis_title="Time into Lap (s)",
+            yaxis_title="Time Delta (s)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            shapes=[dict(
+                type="line", y0=0, y1=0, x0=0, x1=1,
+                xref="paper", yref="y",
+                line=dict(color="#888888", width=1, dash="dash"),
+            )],
+        )
+        st.plotly_chart(fig_time_delta, use_container_width=True)
 
 else:
     st.subheader("Telemetry (Best Lap)")

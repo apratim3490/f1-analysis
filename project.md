@@ -76,7 +76,7 @@ dashboard/                           # Streamlit multi-page dashboard
 
 **Driver Comparison** (`pages/2_Driver_Comparison.py`) — Multi-driver comparison (2-4):
 - Driver header with headshots and team color accent bars
-- Best lap time metrics with delta to session best
+- Best lap time metrics with delta to session best, tyre compound + age, and track temperature
 - Stint comparison table (top 3 consistent stints, std dev < 2s) with sector averages
 - Speed trap grouped bar chart (max I1/I2/ST per driver)
 - Sector time stacked bar (S1/S2/S3 from each driver's fastest lap)
@@ -106,7 +106,7 @@ The `shared/services/` package encapsulates all business logic:
 ### Shared Module
 
 - **Sidebar**: Reusable year → meeting → session → drivers cascade (uses repository)
-- **Stint helpers** (`services/stint_helpers.py`): `summarise_stints()` and `summarise_stints_with_sectors()` with edge-lap outlier trimming
+- **Stint helpers** (`services/stint_helpers.py`): `summarise_stints()`, `summarise_stints_with_sectors()` with edge-lap outlier trimming, `get_compound_for_lap()`, `get_tyre_age_for_lap()`
 - **API logging** (`api_logging.py`): Cross-cutting file logger with `@log_api_call` and `@log_service_call` decorators
 - **Color handling**: Teammate disambiguation via `COMPARISON_COLORS` fallback palette
 
@@ -158,7 +158,7 @@ User code / Dashboard
 
 ## Testing
 
-- **173 tests** across client library (`tests/openf1/`) and dashboard (`tests/dashboard/`)
+- **224 tests** across client library (`tests/openf1/`) and dashboard (`tests/dashboard/`)
 - Test categories: filters (unit), HTTP transport (mocked), models (deserialization), client (integration with mocked API), dashboard services, data layer, stint helpers, logging
 - Async tests via `pytest-asyncio` with `asyncio_mode = auto`
 

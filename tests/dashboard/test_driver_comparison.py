@@ -9,6 +9,7 @@ import pytest
 from shared.data.base import F1DataRepository
 from shared.data.errors import F1DataError
 from shared.services.driver_comparison import (
+    DeltaComparisonData,
     DriverBestLap,
     DriverComparisonService,
     DriverTelemetryTrace,
@@ -16,9 +17,13 @@ from shared.services.driver_comparison import (
     StintInsights,
     TelemetryPoint,
     TrackMapData,
+    _compute_distance_profile,
     _estimate_stint_temperature,
+    _interpolate_distance_at_time,
     _interpolate_position,
     _interpolate_speed,
+    _interpolate_speed_linear,
+    _interpolate_time_at_distance,
 )
 
 
@@ -95,7 +100,7 @@ class TestFetchComparisonData:
 class TestComputeBestLaps:
     def test_returns_best_for_each(self, service, two_driver_data, two_drivers):
         all_laps = two_driver_data[1]["laps"] + two_driver_data[44]["laps"]
-        result = service.compute_best_laps(two_driver_data, all_laps, two_drivers)
+        result = service.compute_best_laps(two_driver_data, all_laps, two_drivers, weather=[])
 
         assert len(result) == 2
         assert all(isinstance(bl, DriverBestLap) for bl in result)
@@ -106,7 +111,7 @@ class TestComputeBestLaps:
 
     def test_delta_to_session_best(self, service, two_driver_data, two_drivers):
         all_laps = two_driver_data[1]["laps"] + two_driver_data[44]["laps"]
-        result = service.compute_best_laps(two_driver_data, all_laps, two_drivers)
+        result = service.compute_best_laps(two_driver_data, all_laps, two_drivers, weather=[])
 
         # VER has session best
         assert result[0].delta is not None
@@ -117,10 +122,44 @@ class TestComputeBestLaps:
 
     def test_ideal_lap(self, service, two_driver_data, two_drivers):
         all_laps = two_driver_data[1]["laps"] + two_driver_data[44]["laps"]
-        result = service.compute_best_laps(two_driver_data, all_laps, two_drivers)
+        result = service.compute_best_laps(two_driver_data, all_laps, two_drivers, weather=[])
 
         for bl in result:
             assert bl.ideal_lap is not None
+
+    def test_compound_and_tyre_age(self, service, two_driver_data, two_drivers):
+        all_laps = two_driver_data[1]["laps"] + two_driver_data[44]["laps"]
+        result = service.compute_best_laps(two_driver_data, all_laps, two_drivers, weather=[])
+
+        # Both drivers have SOFT stints spanning laps 1-8; best lap is lap 1
+        for bl in result:
+            assert bl.compound == "SOFT"
+            assert bl.tyre_age == 0  # lap 1, tyre_age_at_start=0
+
+    def test_track_temperature(self, service, two_driver_data, two_drivers):
+        all_laps = two_driver_data[1]["laps"] + two_driver_data[44]["laps"]
+        weather = [
+            {"track_temperature": 30.0, "timestamp": "2025-02-26T10:00:00"},
+            {"track_temperature": 35.0, "timestamp": "2025-02-26T11:00:00"},
+        ]
+        result = service.compute_best_laps(
+            two_driver_data, all_laps, two_drivers, weather=weather,
+        )
+
+        for bl in result:
+            assert bl.track_temp is not None
+            assert 25.0 <= bl.track_temp <= 40.0
+
+    def test_no_stints_returns_none(self, service, make_lap):
+        driver_data = {
+            1: {"laps": [make_lap(1, lap_duration=90.0)], "stints": []},
+        }
+        drivers = [{"driver_number": 1, "name_acronym": "VER"}]
+        all_laps = driver_data[1]["laps"]
+        result = service.compute_best_laps(driver_data, all_laps, drivers, weather=[])
+
+        assert result[0].compound is None
+        assert result[0].tyre_age is None
 
 
 class TestComputeStintComparison:
@@ -569,3 +608,423 @@ class TestInterpolateSpeed:
             {"t": 1.0, "speed": 250, "rpm": 11000},
         ]
         assert _interpolate_speed(car, 5.0) == 250
+
+
+class TestInterpolateSpeedLinear:
+    def test_midpoint_interpolation(self):
+        car = [
+            {"t": 0.0, "speed": 100, "rpm": 10000},
+            {"t": 1.0, "speed": 200, "rpm": 11000},
+        ]
+        result = _interpolate_speed_linear(car, 0.5)
+        assert result == pytest.approx(150.0)
+
+    def test_quarter_interpolation(self):
+        car = [
+            {"t": 0.0, "speed": 100, "rpm": 10000},
+            {"t": 1.0, "speed": 200, "rpm": 11000},
+        ]
+        result = _interpolate_speed_linear(car, 0.25)
+        assert result == pytest.approx(125.0)
+
+    def test_clamp_before(self):
+        car = [
+            {"t": 1.0, "speed": 200, "rpm": 10000},
+            {"t": 2.0, "speed": 300, "rpm": 11000},
+        ]
+        assert _interpolate_speed_linear(car, 0.0) == pytest.approx(200.0)
+
+    def test_clamp_after(self):
+        car = [
+            {"t": 0.0, "speed": 100, "rpm": 10000},
+            {"t": 1.0, "speed": 200, "rpm": 11000},
+        ]
+        assert _interpolate_speed_linear(car, 5.0) == pytest.approx(200.0)
+
+    def test_empty_returns_zero(self):
+        assert _interpolate_speed_linear([], 1.0) == pytest.approx(0.0)
+
+
+# ── Distance Profile Tests ────────────────────────────────────────────────
+
+
+class TestDistanceProfile:
+    def test_known_speed_and_time(self):
+        """Constant 360 km/h = 100 m/s → after 1s should be 100m."""
+        car = [
+            {"t": 0.0, "speed": 360, "rpm": 10000, "throttle": 100, "brake": 0, "n_gear": 7, "drs": 0},
+            {"t": 1.0, "speed": 360, "rpm": 10000, "throttle": 100, "brake": 0, "n_gear": 7, "drs": 0},
+            {"t": 2.0, "speed": 360, "rpm": 10000, "throttle": 100, "brake": 0, "n_gear": 7, "drs": 0},
+        ]
+        profile = _compute_distance_profile(car)
+        assert len(profile) == 3
+        assert profile[0] == (0.0, 0.0)
+        assert profile[1][1] == pytest.approx(100.0)
+        assert profile[2][1] == pytest.approx(200.0)
+
+    def test_accelerating(self):
+        """0 → 360 km/h over 1s → avg 180 km/h = 50 m/s → 50m."""
+        car = [
+            {"t": 0.0, "speed": 0, "rpm": 5000, "throttle": 100, "brake": 0, "n_gear": 1, "drs": 0},
+            {"t": 1.0, "speed": 360, "rpm": 10000, "throttle": 100, "brake": 0, "n_gear": 3, "drs": 0},
+        ]
+        profile = _compute_distance_profile(car)
+        assert len(profile) == 2
+        assert profile[1][1] == pytest.approx(50.0)
+
+    def test_empty_input(self):
+        assert _compute_distance_profile([]) == []
+
+
+# ── Interpolate Time at Distance Tests ─────────────────────────────────────
+
+
+class TestInterpolateTimeAtDistance:
+    def test_midpoint_interpolation(self):
+        profile = [(0.0, 0.0), (1.0, 100.0), (2.0, 200.0)]
+        result = _interpolate_time_at_distance(profile, 50.0)
+        assert result == pytest.approx(0.5)
+
+    def test_exact_match(self):
+        profile = [(0.0, 0.0), (1.0, 100.0), (2.0, 200.0)]
+        result = _interpolate_time_at_distance(profile, 100.0)
+        assert result == pytest.approx(1.0)
+
+    def test_before_start_returns_none(self):
+        profile = [(0.0, 10.0), (1.0, 110.0)]
+        assert _interpolate_time_at_distance(profile, 5.0) is None
+
+    def test_after_end_returns_none(self):
+        profile = [(0.0, 0.0), (1.0, 100.0)]
+        assert _interpolate_time_at_distance(profile, 150.0) is None
+
+    def test_empty_returns_none(self):
+        assert _interpolate_time_at_distance([], 50.0) is None
+
+
+# ── Interpolate Distance at Time Tests ─────────────────────────────────────
+
+
+class TestInterpolateDistanceAtTime:
+    def test_midpoint(self):
+        profile = [(0.0, 0.0), (1.0, 100.0), (2.0, 200.0)]
+        result = _interpolate_distance_at_time(profile, 0.5)
+        assert result == pytest.approx(50.0)
+
+    def test_exact_match(self):
+        profile = [(0.0, 0.0), (1.0, 100.0), (2.0, 200.0)]
+        result = _interpolate_distance_at_time(profile, 1.0)
+        assert result == pytest.approx(100.0)
+
+    def test_before_start_returns_none(self):
+        profile = [(1.0, 0.0), (2.0, 100.0)]
+        assert _interpolate_distance_at_time(profile, 0.5) is None
+
+    def test_after_end_returns_none(self):
+        profile = [(0.0, 0.0), (1.0, 100.0)]
+        assert _interpolate_distance_at_time(profile, 1.5) is None
+
+    def test_empty_returns_none(self):
+        assert _interpolate_distance_at_time([], 0.5) is None
+
+
+# ── Speed Delta Tests ──────────────────────────────────────────────────────
+
+
+def _make_car_telemetry(t_values: list[float], speeds: list[int]) -> list[dict]:
+    """Build car telemetry dicts from parallel time and speed lists."""
+    return [
+        {"t": t, "speed": s, "rpm": 10000, "throttle": 100, "brake": 0, "n_gear": 5, "drs": 0}
+        for t, s in zip(t_values, speeds)
+    ]
+
+
+class TestComputeSpeedDelta:
+    def test_two_drivers_correct_signs(self):
+        """Faster compared driver → positive delta."""
+        times = [float(i) for i in range(20)]
+        # Reference is slower (200 km/h), compared is faster (220 km/h)
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry(times, [200] * 20),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+            44: {
+                "car": _make_car_telemetry(times, [220] * 20),
+                "location": [],
+                "acronym": "HAM",
+                "color": "#E80020",
+            },
+        }
+        result = DriverComparisonService.compute_speed_delta(telemetry)
+
+        assert result is not None
+        assert isinstance(result, DeltaComparisonData)
+        assert len(result.traces) == 1
+        # X-axis is now track position (meters)
+        assert result.traces[0].points[0].t == pytest.approx(0.0)
+        assert result.traces[0].points[-1].t > 100.0  # covers distance
+        # HAM is 20 km/h faster → all delta values should be +20
+        for p in result.traces[0].points:
+            assert p.value == pytest.approx(20.0)
+
+    def test_slower_driver_negative_delta(self):
+        """Slower compared driver → negative delta."""
+        times = [float(i) for i in range(20)]
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry(times, [250] * 20),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+            44: {
+                "car": _make_car_telemetry(times, [230] * 20),
+                "location": [],
+                "acronym": "HAM",
+                "color": "#E80020",
+            },
+        }
+        result = DriverComparisonService.compute_speed_delta(telemetry)
+
+        assert result is not None
+        for p in result.traces[0].points:
+            assert p.value == pytest.approx(-20.0)
+
+    def test_single_driver_returns_none(self):
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry([0.0, 1.0], [200, 210]),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+        }
+        assert DriverComparisonService.compute_speed_delta(telemetry) is None
+
+    def test_empty_car_data_returns_none(self):
+        telemetry = {
+            1: {"car": [], "location": [], "acronym": "VER", "color": "#3671C6"},
+            44: {"car": [], "location": [], "acronym": "HAM", "color": "#E80020"},
+        }
+        assert DriverComparisonService.compute_speed_delta(telemetry) is None
+
+    def test_reference_is_driver_with_most_data(self):
+        """Reference should be the driver with most data points."""
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry([float(i) for i in range(10)], [200] * 10),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+            44: {
+                "car": _make_car_telemetry([float(i) for i in range(20)], [220] * 20),
+                "location": [],
+                "acronym": "HAM",
+                "color": "#E80020",
+            },
+        }
+        result = DriverComparisonService.compute_speed_delta(telemetry)
+
+        assert result is not None
+        # HAM has more data → is the reference
+        assert result.reference_acronym == "HAM"
+        # Only VER should be in the traces
+        assert len(result.traces) == 1
+        assert result.traces[0].acronym == "VER"
+
+
+# ── Time Delta Tests ───────────────────────────────────────────────────────
+
+
+class TestComputeTimeDelta:
+    def test_two_drivers_slower_is_positive(self):
+        """A slower driver should have positive time delta."""
+        times = [float(i) * 0.5 for i in range(40)]
+        # Both at same speed → same time at same distance → delta ≈ 0
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry(times, [200] * 40),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+            44: {
+                "car": _make_car_telemetry(times, [200] * 40),
+                "location": [],
+                "acronym": "HAM",
+                "color": "#E80020",
+            },
+        }
+        result = DriverComparisonService.compute_time_delta(telemetry)
+
+        assert result is not None
+        assert len(result.traces) == 1
+        # Same speed → delta should be ~0 everywhere
+        for p in result.traces[0].points:
+            assert abs(p.value) < 0.01
+
+    def test_slower_driver_accumulates_positive_delta(self):
+        """A driver going slower takes more time to cover same distance."""
+        # VER: 360 km/h = 100 m/s, covers 10s
+        # HAM: 180 km/h = 50 m/s, covers 10s
+        times_ver = [float(i) * 0.5 for i in range(21)]  # 0 to 10s
+        times_ham = [float(i) * 0.5 for i in range(21)]  # 0 to 10s
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry(times_ver, [360] * 21),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+            44: {
+                "car": _make_car_telemetry(times_ham, [180] * 21),
+                "location": [],
+                "acronym": "HAM",
+                "color": "#E80020",
+            },
+        }
+        result = DriverComparisonService.compute_time_delta(telemetry)
+
+        assert result is not None
+        assert len(result.traces) == 1
+        # X-axis is time (seconds into lap), delta should be positive and growing
+        values = [p.value for p in result.traces[0].points]
+        positive_count = sum(1 for v in values if v > 0)
+        assert positive_count > len(values) * 0.8
+
+    def test_time_grid_covers_lap(self):
+        """Time grid should start at 0 and cover the reference driver's lap."""
+        times = [float(i) * 0.5 for i in range(40)]
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry(times, [300] * 40),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+            44: {
+                "car": _make_car_telemetry(times, [290] * 40),
+                "location": [],
+                "acronym": "HAM",
+                "color": "#E80020",
+            },
+        }
+        result = DriverComparisonService.compute_time_delta(telemetry)
+
+        assert result is not None
+        time_points = [p.t for p in result.traces[0].points]
+        assert time_points[0] == pytest.approx(0.0)
+        # Should cover most of the lap duration (19.5s)
+        assert time_points[-1] > 15.0
+
+    def test_single_driver_returns_none(self):
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry([0.0, 1.0], [200, 210]),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+        }
+        assert DriverComparisonService.compute_time_delta(telemetry) is None
+
+    def test_empty_data_returns_none(self):
+        telemetry = {
+            1: {"car": [], "location": [], "acronym": "VER", "color": "#3671C6"},
+            44: {"car": [], "location": [], "acronym": "HAM", "color": "#E80020"},
+        }
+        assert DriverComparisonService.compute_time_delta(telemetry) is None
+
+    def test_exact_time_delta_values(self):
+        """Verify exact delta values: VER at 100 m/s, HAM at 50 m/s."""
+        times = [float(i) * 0.5 for i in range(21)]  # 0 to 10s
+        telemetry = {
+            1: {
+                "car": _make_car_telemetry(times, [360] * 21),
+                "location": [],
+                "acronym": "VER",
+                "color": "#3671C6",
+            },
+            44: {
+                "car": _make_car_telemetry(times, [180] * 21),
+                "location": [],
+                "acronym": "HAM",
+                "color": "#E80020",
+            },
+        }
+        result = DriverComparisonService.compute_time_delta(telemetry)
+
+        assert result is not None
+        # VER (ref) at 100 m/s, HAM at 50 m/s.
+        # At ref time t, VER has covered d = 100*t meters.
+        # HAM takes d/50 = 100*t/50 = 2*t seconds to cover that.
+        # delta = 2*t - t = t
+        for p in result.traces[0].points:
+            assert p.value == pytest.approx(p.t, abs=0.01)
+
+    def test_unsorted_data_handled(self):
+        """Unsorted telemetry data should still produce correct results."""
+        import random
+        rng = random.Random(42)
+
+        sorted_times = [float(i) for i in range(20)]
+        car1_sorted = _make_car_telemetry(sorted_times, [200] * 20)
+        car2_sorted = _make_car_telemetry(sorted_times, [220] * 20)
+        car1_shuffled = car1_sorted.copy()
+        car2_shuffled = car2_sorted.copy()
+        rng.shuffle(car1_shuffled)
+        rng.shuffle(car2_shuffled)
+
+        telemetry_sorted = {
+            1: {"car": car1_sorted, "location": [], "acronym": "VER", "color": "#3671C6"},
+            44: {"car": car2_sorted, "location": [], "acronym": "HAM", "color": "#E80020"},
+        }
+        telemetry_shuffled = {
+            1: {"car": car1_shuffled, "location": [], "acronym": "VER", "color": "#3671C6"},
+            44: {"car": car2_shuffled, "location": [], "acronym": "HAM", "color": "#E80020"},
+        }
+
+        result_sorted = DriverComparisonService.compute_time_delta(telemetry_sorted)
+        result_shuffled = DriverComparisonService.compute_time_delta(telemetry_shuffled)
+
+        assert result_sorted is not None
+        assert result_shuffled is not None
+        assert len(result_sorted.traces[0].points) == len(result_shuffled.traces[0].points)
+        for ps, pu in zip(result_sorted.traces[0].points, result_shuffled.traces[0].points):
+            assert ps.t == pytest.approx(pu.t)
+            assert ps.value == pytest.approx(pu.value)
+
+    def test_speed_delta_unsorted_data(self):
+        """Speed delta should also handle unsorted data correctly."""
+        import random
+        rng = random.Random(42)
+
+        times = [float(i) for i in range(20)]
+        car1 = _make_car_telemetry(times, [200] * 20)
+        car2 = _make_car_telemetry(times, [220] * 20)
+        car1_shuffled = car1.copy()
+        car2_shuffled = car2.copy()
+        rng.shuffle(car1_shuffled)
+        rng.shuffle(car2_shuffled)
+
+        telemetry_sorted = {
+            1: {"car": car1, "location": [], "acronym": "VER", "color": "#3671C6"},
+            44: {"car": car2, "location": [], "acronym": "HAM", "color": "#E80020"},
+        }
+        telemetry_shuffled = {
+            1: {"car": car1_shuffled, "location": [], "acronym": "VER", "color": "#3671C6"},
+            44: {"car": car2_shuffled, "location": [], "acronym": "HAM", "color": "#E80020"},
+        }
+
+        result_sorted = DriverComparisonService.compute_speed_delta(telemetry_sorted)
+        result_shuffled = DriverComparisonService.compute_speed_delta(telemetry_shuffled)
+
+        assert result_sorted is not None
+        assert result_shuffled is not None
+        for ps, pu in zip(result_sorted.traces[0].points, result_shuffled.traces[0].points):
+            assert ps.t == pytest.approx(pu.t)
+            assert ps.value == pytest.approx(pu.value)
